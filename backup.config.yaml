@@ -1,0 +1,38 @@
+max_requests_per_second: 2
+slug_strategy: title_plus_id
+exclude_patterns: []
+retry:
+  max_attempts: 6
+  backoff_seconds: [2, 5, 15, 30, 60]
+request_timeout_connect_seconds: 10
+request_timeout_read_seconds: 180
+failure_mode: best_effort
+failure_threshold_percent: 2
+max_consecutive_failures: 20
+staging_keep: 3
+checkpoint_enabled: true
+checkpoint_flush_every: 25
+full_block_json:
+  enabled: true
+  frequency: weekly
+  compression: gzip
+  retention_count: 12
+
+primary_source: official_zip
+official_zip:
+  # workspace (default): export full workspace via NOTION_SPACE_ID
+  # roots: export explicit root pages
+  mode: workspace
+  # Workspace-mode API behavior.
+  workspace_retryable_failure_retries: 3
+  workspace_poll_timeout_seconds: 1500
+  # Fallback to browser-driven workspace export download when API path stalls/fails.
+  workspace_ui_fallback: true
+  workspace_ui_timeout_seconds: 2400
+  # Optional in roots mode. If omitted, script reads backups/manifests/roots.json
+  root_page_ids: []
+  keep_daily_zips_days: 30
+quality:
+  min_md_count: 100
+  min_csv_count: 10
+  max_drop_percent: 60

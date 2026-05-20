@@ -1,0 +1,12 @@
+{
+  "name": "notion-backup-exporter",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Daily Notion workspace backup to a dedicated git branch",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "notion-exporter": "^0.8.1",
+    "playwright": "^1.52.0"
+  }
+}
