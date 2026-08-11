@@ -32,7 +32,8 @@ jobs:
       OFFICIAL_EXPORT_MODE: "workspace"
       OFFICIAL_WORKSPACE_RETRYABLE_FAILURE_RETRIES: "1"
       OFFICIAL_WORKSPACE_POLL_TIMEOUT_SECONDS: "10800"
-      OFFICIAL_WORKSPACE_UI_FALLBACK: "1"
+      # Dormant browser fallback - see scripts/export_workspace_ui.mjs.
+      OFFICIAL_WORKSPACE_UI_FALLBACK: "0"
       OFFICIAL_WORKSPACE_UI_TIMEOUT_SECONDS: "2400"
       QUALITY_MIN_MD_COUNT: "100"
       QUALITY_MIN_CSV_COUNT: "10"
@@ -74,6 +75,8 @@ jobs:
         if: steps.setup.outputs.configured == 'true'
         run: npm install
 
+      # Only needed by the dormant browser fallback (OFFICIAL_WORKSPACE_UI_FALLBACK).
+      # Kept so re-enabling that flag doesn't fail on a missing browser.
       - name: Install Playwright browser
         if: steps.setup.outputs.configured == 'true'
         run: npx playwright install --with-deps chromium

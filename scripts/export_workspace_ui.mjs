@@ -1,4 +1,23 @@
 #!/usr/bin/env node
+//
+// DORMANT as of 2026-08-10 (official_zip.workspace_ui_fallback: false).
+//
+// This script has never produced a successful export in any workflow run, and
+// it is currently broken end-to-end. Notion migrated the app off notion.so:
+// www.notion.so/settings now redirects to app.notion.com, so the cookies this
+// script installs on `.notion.so` do not apply and the session lands on the
+// login page. The 120s wait for the export button then times out, which is
+// what buried the real (unrelated) API error during the Aug 2026 outage.
+//
+// Verified findings for whoever revives it:
+//   - Navigate app.notion.com, not www.notion.so.
+//   - Cookies must be installed on the `.notion.com` domain.
+//   - token_v2 alone is NOT enough: the client also needs a `notion_users`
+//     cookie (URL-encoded JSON array of user ids) or it redirects to /login.
+//     Use the id of the user that actually holds NOTION_SPACE_ID -- picking a
+//     co-signed-in account with no spaces lands on the onboarding screen.
+//   - The settings selectors below are unverified against the current UI.
+//
 import fs from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright";
@@ -71,7 +90,9 @@ async function main() {
   await page.goto("https://www.notion.so/settings", { waitUntil: "domcontentloaded", timeout: 90000 });
 
   const exportAll = page.getByRole("button", { name: /export all workspace content/i });
-  await exportAll.first().waitFor({ timeout: 120000 });
+  // Honor the caller's budget: this used to be hard-coded to 120s, which made
+  // --timeout-seconds (and OFFICIAL_WORKSPACE_UI_TIMEOUT_SECONDS) meaningless.
+  await exportAll.first().waitFor({ timeout: timeoutMs });
   await exportAll.first().click();
 
   // Configure markdown+csv when available.

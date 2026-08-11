@@ -1,0 +1,83 @@
+name: Notion Auth Check
+
+# Fast (~30s) diagnostic for "why is the backup failing?".
+# Answers three questions without running a full export:
+#   1. Is Notion's Cloudflare edge blocking this runner's requests?
+#   2. Is the token_v2 cookie still valid?
+#   3. Is the export endpoint (enqueueTask) reachable?
+#
+# Prints HTTP status codes only. Response bodies are never echoed:
+# getSpaces returns account data (emails, workspace names).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  auth-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NATIVE_EXPORT_TOKEN_V2: ${{ secrets.NATIVE_EXPORT_TOKEN_V2 }}
+      NATIVE_EXPORT_FILE_TOKEN: ${{ secrets.NATIVE_EXPORT_FILE_TOKEN }}
+      BROWSER_UA: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    steps:
+      - name: Check setup
+        id: setup
+        run: |
+          if [ -z "${NATIVE_EXPORT_TOKEN_V2:-}" ]; then
+            echo "::notice title=Notion backup not configured::Add the NATIVE_EXPORT_TOKEN_V2 repository secret in Settings > Secrets and variables > Actions, then rerun this workflow. See README.md for cookie retrieval steps."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Probe Notion api/v3
+        if: steps.setup.outputs.configured == 'true'
+        run: |
+          set -uo pipefail
+          COOKIE="token_v2=${NATIVE_EXPORT_TOKEN_V2};file_token=${NATIVE_EXPORT_FILE_TOKEN}"
+          FAIL=0
+
+          # 1. getSpaces with a browser UA -> expect 200 (edge lets us through, cookie is alive)
+          CODE=$(curl -s -o /tmp/probe1.txt -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" -H "Cookie: ${COOKIE}" -A "${BROWSER_UA}" \
+            --data '{}' https://www.notion.so/api/v3/getSpaces)
+          echo "1) getSpaces (browser UA)      -> ${CODE}  (expect 200)"
+          if [ "${CODE}" != "200" ]; then
+            FAIL=1
+            if grep -qi cloudflare /tmp/probe1.txt; then
+              echo "   !! Cloudflare block from this runner IP. A User-Agent alone is not enough here."
+            elif [ "${CODE}" = "401" ]; then
+              echo "   !! Cookie rejected. Rotate NATIVE_EXPORT_TOKEN_V2 (see README.md)."
+            fi
+          fi
+
+          # 2. Control: UA "node" is what Node's built-in fetch sends by default.
+          #    Notion's WAF blocks that literal string; this probe documents the rule still exists.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" -H "Cookie: ${COOKIE}" -A "node" \
+            --data '{}' https://www.notion.so/api/v3/getSpaces)
+          echo "2) getSpaces (UA 'node')       -> ${CODE}  (expect 403 = WAF rule still in force)"
+          if [ "${CODE}" = "200" ]; then
+            echo "   note: the UA rule appears to have been lifted; NOTION_USER_AGENT is no longer load-bearing."
+          fi
+
+          # 3. enqueueTask with a deliberately invalid task -> expect Notion's own 400,
+          #    proving the export endpoint is reachable. Queues nothing.
+          CODE=$(curl -s -o /tmp/probe3.txt -w '%{http_code}' -X POST \
+            -H "Content-Type: application/json" -H "Cookie: ${COOKIE}" -A "${BROWSER_UA}" \
+            --data '{"task":{"eventName":"authCheckProbe_invalidOnPurpose","request":{}}}' \
+            https://www.notion.so/api/v3/enqueueTask)
+          if grep -q isNotionError /tmp/probe3.txt; then REACHED="Notion"; else REACHED="NOT Notion (edge or proxy)"; fi
+          echo "3) enqueueTask (bogus task)    -> ${CODE}  (expect 400, answered by ${REACHED})"
+          if [ "${CODE}" != "400" ] || [ "${REACHED}" != "Notion" ]; then FAIL=1; fi
+
+          echo
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "RESULT: auth check FAILED - see notes above."
+            exit 1
+          fi
+          echo "RESULT: auth check passed - edge open, cookie valid, export endpoint reachable."

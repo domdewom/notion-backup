@@ -7,6 +7,20 @@ import dotenv from "dotenv";
 
 let retryAttemptsTotal = 0;
 
+// Notion's Cloudflare edge blocks requests whose User-Agent is the literal
+// string "node" -- which is exactly what Node's built-in fetch sends by
+// default. Every api/v3 call must therefore set a UA explicitly, or it is
+// rejected with a Cloudflare HTML 403 before Notion ever sees it.
+// Overridable via NOTION_USER_AGENT so the value can be rotated without a
+// code push if the WAF rule tightens again.
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+function userAgent() {
+  const override = String(process.env.NOTION_USER_AGENT || "").trim();
+  return override || DEFAULT_USER_AGENT;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -230,6 +244,19 @@ function notionCookieHeader(tokenV2, fileToken) {
   return `token_v2=${tokenV2};file_token=${fileToken}`;
 }
 
+// Classify a non-2xx api/v3 response. Distinguishes an edge (Cloudflare) block
+// from a genuine Notion error, because the two need opposite responses: the
+// former is a header/IP problem, the latter is an auth or payload problem.
+function describeApiFailure(res, bodyText) {
+  const server = res.headers.get("server") || "";
+  const cfRay = res.headers.get("cf-ray");
+  const cfMitigated = res.headers.get("cf-mitigated");
+  const snippet = (bodyText || "").slice(0, 300).replace(/\s+/g, " ").trim();
+  const isJson = snippet.startsWith("{");
+  const blockedByEdge = /cloudflare/i.test(server) && !isJson;
+  return { server, cfRay, cfMitigated, snippet, blockedByEdge };
+}
+
 async function notionApiPost(pathname, body, cookieHeader) {
   const maxAttempts = 16;
   const stage = stageLabel(pathname);
@@ -241,6 +268,7 @@ async function notionApiPost(pathname, body, cookieHeader) {
         headers: {
           "Content-Type": "application/json",
           Cookie: cookieHeader,
+          "User-Agent": userAgent(),
         },
         body: JSON.stringify(body),
       });
@@ -268,9 +296,21 @@ async function notionApiPost(pathname, body, cookieHeader) {
       continue;
     }
 
-    throw Object.assign(new Error(`Notion API ${pathname} failed: HTTP ${status}`), {
+    // Not retryable. Read the body before throwing: a bare status code is what
+    // made this failure mode opaque for days. 403 from the edge and 401 from
+    // Notion demand completely different fixes, and only the body says which.
+    const bodyText = await res.text().catch(() => "");
+    const info = describeApiFailure(res, bodyText);
+    const detail = info.blockedByEdge
+      ? ` - blocked by Cloudflare edge (cf-ray=${info.cfRay || "?"}${info.cfMitigated ? `, cf-mitigated=${info.cfMitigated}` : ""}); the request never reached Notion. ` +
+        `Check NOTION_USER_AGENT (Node's default UA "node" is blocked) or run the Notion Auth Check workflow.`
+      : ` body=${info.snippet}`;
+    throw Object.assign(new Error(`Notion API ${pathname} failed: HTTP ${status}${detail}`), {
       stage,
       httpStatus: status,
+      blockedByEdge: info.blockedByEdge,
+      cfRay: info.cfRay,
+      responseSnippet: info.snippet,
     });
   }
   throw Object.assign(new Error(`Notion API ${pathname} failed after retries`), {
@@ -294,7 +334,7 @@ async function downloadExportZip(exportUrl, cookieHeader, maxAttempts = 3) {
           Cookie: cookieHeader,
           Referer: "https://www.notion.so/",
           Origin: "https://www.notion.so",
-          "User-Agent": "Mozilla/5.0 (NotionBackupExporter)",
+          "User-Agent": userAgent(),
         },
       });
       if (!res.ok) {
@@ -325,19 +365,37 @@ async function downloadExportZip(exportUrl, cookieHeader, maxAttempts = 3) {
 }
 
 function extractZipToDir(zipPath, destDir) {
-  // Use the OS unzip binary instead of adm-zip. adm-zip silently skips entries
+  // Use an OS extractor instead of adm-zip. adm-zip silently skips entries
   // on Notion exports (long paths + UTF-8 filenames), producing 0 files with
-  // no exception. unzip is present on GitHub Actions ubuntu-latest and macOS.
+  // no exception.
+  //
+  // Extractor choice is platform-dependent, and this is not cosmetic:
+  //   - Linux (CI): `unzip`. Ubuntu's build carries the UTF-8 filename-flag
+  //     patch, so non-ASCII names extract correctly.
+  //   - macOS (local debugging): `ditto`. Apple's `unzip` is Info-ZIP 6.00
+  //     (2009) *without* that patch. It mangles non-ASCII page titles, APFS
+  //     rejects the resulting invalid byte sequence, and unzip reports the
+  //     failure as `write error (disk full?)` with exit 50 -- on a disk with
+  //     plenty of space free. `ditto` honors the flag and extracts cleanly.
   mkdirp(destDir);
-  const result = spawnSync("unzip", ["-q", "-o", zipPath, "-d", destDir], {
+  const useDitto = process.platform === "darwin" && fs.existsSync("/usr/bin/ditto");
+  const cmd = useDitto ? "/usr/bin/ditto" : "unzip";
+  const args = useDitto ? ["-x", "-k", zipPath, destDir] : ["-q", "-o", zipPath, "-d", destDir];
+  const result = spawnSync(cmd, args, {
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 16,
   });
   if (result.status !== 0) {
     const stderr = (result.stderr || "").trim().slice(0, 500);
     const stdout = (result.stdout || "").trim().slice(0, 200);
+    // Exit 50 is Info-ZIP's "disk full". It is almost never a full disk here:
+    // check free space before believing it.
+    const hint =
+      result.status === 50
+        ? ` (exit 50 is "disk full" -- verify with \`df -h\`; if there is free space this is a filename-encoding failure, not a capacity one)`
+        : "";
     throw new Error(
-      `unzip failed (exit ${result.status}): stderr="${stderr}" stdout="${stdout}"`
+      `${path.basename(cmd)} failed (exit ${result.status})${hint}: stderr="${stderr}" stdout="${stdout}"`
     );
   }
 }
@@ -413,6 +471,50 @@ async function fetchExportUrlFromNotifications(spaceIdDashed, startTimeMs, cooki
   } catch {
     return null;
   }
+}
+
+// Cheap auth/edge canary. Runs before any export work so the three failure
+// classes -- edge block, dead cookie, failed export -- are told apart in the
+// first two seconds of a run instead of after a long poll timeout.
+async function preflightCheck(cookieHeader) {
+  let res;
+  try {
+    res = await fetch("https://www.notion.so/api/v3/getSpaces", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: cookieHeader,
+        "User-Agent": userAgent(),
+      },
+      body: "{}",
+    });
+  } catch (err) {
+    return { ok: false, reason: "network", message: `preflight request failed: ${String(err?.message || err)}` };
+  }
+
+  if (res.ok) return { ok: true };
+
+  const info = describeApiFailure(res, await res.text().catch(() => ""));
+  if (info.blockedByEdge) {
+    return {
+      ok: false,
+      reason: "blocked_by_edge",
+      message:
+        `Blocked by Notion's Cloudflare edge (HTTP ${res.status}, cf-ray=${info.cfRay || "?"}). ` +
+        `The request never reached Notion, so this is NOT an expired cookie. ` +
+        `Set NOTION_USER_AGENT to a browser user-agent, or run the Notion Auth Check workflow to see whether this runner's IP is blocked.`,
+    };
+  }
+  if (res.status === 401) {
+    return {
+      ok: false,
+      reason: "auth",
+      message:
+        `Notion rejected the cookie (HTTP 401). Rotate NATIVE_EXPORT_TOKEN_V2 ` +
+        `(and NATIVE_EXPORT_FILE_TOKEN if set) per README.md. body=${info.snippet}`,
+    };
+  }
+  return { ok: false, reason: "unknown", message: `preflight failed: HTTP ${res.status} body=${info.snippet}` };
 }
 
 async function getExportZip(rootId, tokenV2, fileToken) {
@@ -638,6 +740,13 @@ async function main() {
     return 2;
   }
 
+  const preflight = await preflightCheck(notionCookieHeader(tokenV2, fileToken));
+  if (!preflight.ok) {
+    console.error(`Preflight check failed (${preflight.reason}): ${preflight.message}`);
+    return 2;
+  }
+  console.log("Preflight OK: Notion api/v3 reachable and cookie accepted.");
+
   const exportMode = readOfficialZipMode(cfg);
   const rootTitleById = loadWorkspaceRootMeta(repoRoot);
   const configuredRoots = readRootPageIds(repoRoot, cfg).map(normalizeId);
@@ -673,9 +782,12 @@ async function main() {
       cfg?.official_zip?.workspace_poll_timeout_seconds ||
       "1500"
   );
+  // Dormant by default: the browser fallback has never produced a successful
+  // export, and its 120s login-page timeout masked the real API error. See the
+  // header comment in scripts/export_workspace_ui.mjs before re-enabling.
   const workspaceUiFallbackEnabled = parseBoolLike(
-    process.env.OFFICIAL_WORKSPACE_UI_FALLBACK ?? cfg?.official_zip?.workspace_ui_fallback ?? true,
-    true
+    process.env.OFFICIAL_WORKSPACE_UI_FALLBACK ?? cfg?.official_zip?.workspace_ui_fallback ?? false,
+    false
   );
   const workspaceUiTimeoutSeconds = Number(
     process.env.OFFICIAL_WORKSPACE_UI_TIMEOUT_SECONDS || cfg?.official_zip?.workspace_ui_timeout_seconds || "2400"
@@ -778,6 +890,9 @@ async function main() {
             root_title: "workspace",
             stage: uiErr?.stage || "ui_fallback",
             http_status: workspaceApiError?.httpStatus ?? null,
+            blocked_by_edge: workspaceApiError?.blockedByEdge ?? false,
+            cf_ray: workspaceApiError?.cfRay ?? null,
+            response_snippet: workspaceApiError?.responseSnippet ?? null,
             export_url_host: workspaceApiError?.exportUrlHost ?? null,
             task_state: workspaceApiError?.taskState ?? null,
             task_id: workspaceApiError?.taskId ?? null,
@@ -799,6 +914,9 @@ async function main() {
           root_title: "workspace",
           stage: err?.stage || "unknown",
           http_status: err?.httpStatus ?? null,
+          blocked_by_edge: err?.blockedByEdge ?? false,
+          cf_ray: err?.cfRay ?? null,
+          response_snippet: err?.responseSnippet ?? null,
           export_url_host: err?.exportUrlHost ?? null,
           task_state: err?.taskState ?? null,
           task_id: err?.taskId ?? null,

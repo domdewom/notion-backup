@@ -26,8 +26,11 @@ official_zip:
   # Workspace-mode API behavior.
   workspace_retryable_failure_retries: 3
   workspace_poll_timeout_seconds: 1500
-  # Fallback to browser-driven workspace export download when API path stalls/fails.
-  workspace_ui_fallback: true
+  # Browser-driven fallback. Dormant: it has never produced a successful export
+  # and is broken against Notion's app.notion.com migration. Leaving it enabled
+  # only masks the real API error behind a login-page timeout. See the header
+  # comment in scripts/export_workspace_ui.mjs before switching this back on.
+  workspace_ui_fallback: false
   workspace_ui_timeout_seconds: 2400
   # Optional in roots mode. If omitted, script reads backups/manifests/roots.json
   root_page_ids: []
