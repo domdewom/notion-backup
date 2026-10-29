@@ -585,10 +585,13 @@ async function getWorkspaceExportZip(spaceId, tokenV2, fileToken, options = {}) 
           request: {
             spaceId: parsed.dashed,
             shouldExportComments: false,
+            // Matches the workspace export UI's "Include private pages" toggle.
+            includePrivatePages: true,
             exportOptions: {
               exportType: "markdown",
               timeZone: "UTC",
               locale: "en",
+              includeContents: "everything",
             },
           },
         },
@@ -1054,6 +1057,8 @@ async function main() {
     workspace_id_input_format: exportMode === "workspace" ? parsedSpace?.format || null : null,
     workspace_api: exportMode === "workspace"
       ? {
+          include_private_pages: true,
+          include_contents: "everything",
           retryable_failure_retries: workspaceRetryableRetries,
           poll_timeout_seconds: workspacePollTimeoutSeconds,
           ui_fallback_enabled: workspaceUiFallbackEnabled,

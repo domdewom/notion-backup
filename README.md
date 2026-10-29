@@ -102,6 +102,8 @@ Must be the **dashed** UUID form, not the 32-char compact form.
 - **`workspace`** (default) — one full workspace export per run, driven by `NOTION_SPACE_ID`.
 - **`roots`** (legacy) — per-root-page exports, driven by `OFFICIAL_EXPORT_ROOT_PAGE_IDS` env or `backups/manifests/roots.json`. Kept for emergency recovery.
 
+The workspace API request explicitly enables **Include private pages** (`request.includePrivatePages: true`) and **Page content: Everything** (`request.exportOptions.includeContents: "everything"`). This includes private pages accessible to the account used by the export cookies. Both requested settings are recorded under `workspace_api` in the run summary. Compare coverage with a manual export to verify that expected private pages are present.
+
 Workspace-mode tunables (env vars or `backup.config.yaml`):
 
 | Env | Default | Purpose |
