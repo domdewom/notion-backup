@@ -34,7 +34,6 @@ official_zip:
   workspace_ui_timeout_seconds: 2400
   # Optional in roots mode. If omitted, script reads backups/manifests/roots.json
   root_page_ids: []
-  keep_daily_zips_days: 30
 quality:
   min_md_count: 100
   min_csv_count: 10

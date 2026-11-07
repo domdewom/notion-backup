@@ -760,6 +760,12 @@ def promote_staging(stage_backups: Path, canonical_backups: Path):
         dst = canonical_backups / name
         if not src.exists():
             continue
+        if name == "manifests" and dst.exists():
+            # The optional API run follows the official export. Preserve its
+            # quality baseline and workspace report for publishing and tomorrow.
+            for report in ("coverage_report.json", "workspace_export.json"):
+                if (dst / report).exists():
+                    shutil.copy2(dst / report, src / report)
         if dst.exists():
             shutil.rmtree(dst)
         shutil.move(str(src), str(dst))

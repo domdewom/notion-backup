@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import html
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 try:
@@ -45,18 +47,23 @@ def page_template(title: str, body: str) -> str:
 """
 
 
-def main() -> int:
-    repo = Path(__file__).resolve().parents[1]
+def main(repo: Path | None = None) -> int:
+    repo = repo or Path(__file__).resolve().parents[1]
     official_root = repo / "backups" / "official"
     notion_md_root = repo / "backups" / "notion-md"
     md_root = official_root if official_root.exists() else notion_md_root
     site_root = repo / "backups" / "site"
-    site_root.mkdir(parents=True, exist_ok=True)
+    md_paths = sorted(md_root.rglob("*.md"))
+    if not md_paths:
+        raise RuntimeError("No Markdown files to render; preserving the previous site")
+    stage_root = repo / "backups" / ".staging"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    build_root = Path(tempfile.mkdtemp(prefix="html-", dir=stage_root))
 
     links: list[str] = []
-    for md_path in sorted(md_root.rglob("*.md")):
+    for md_path in md_paths:
         rel = md_path.relative_to(md_root)
-        out = site_root / rel.with_suffix(".html")
+        out = build_root / rel.with_suffix(".html")
         out.parent.mkdir(parents=True, exist_ok=True)
 
         src = md_path.read_text(encoding="utf-8")
@@ -73,7 +80,11 @@ def main() -> int:
         "Notion Backup",
         f"<h1>Notion Backup</h1><p>Source: <code>{html.escape(source_label)}</code></p><ul>{''.join(links)}</ul>",
     )
-    (site_root / "index.html").write_text(index, encoding="utf-8")
+    (build_root / "index.html").write_text(index, encoding="utf-8")
+    # Only replace the previous site after every page rendered successfully.
+    if site_root.exists():
+        shutil.rmtree(site_root)
+    build_root.rename(site_root)
     print(f"Rendered {len(links)} HTML pages from {source_label}")
     return 0
 

@@ -38,7 +38,8 @@ Exported backups contain the full content of your Notion workspace — pages, da
 ## Branch model (load-bearing)
 
 - **`main`** — workflow file, scripts, config only. `backups/` is gitignored on `main`; never commit backup output here.
-- **`notion-backups`** — orphan branch dedicated to backup artifacts. Each successful workflow run replaces the full `backups/` tree with a fresh snapshot and pushes a new commit. History exists, but each commit is a full snapshot, not a diff.
+- **`notion-backups`** — dedicated backup branch. Each successful run publishes a verified snapshot as a normal child commit, preserving history.
+- **`notion-export-state`** — pending export checkpoint, containing only the task ID, workspace ID, and request timestamp. It never stores credentials or signed download links.
 
 Browse a snapshot:
 
@@ -47,7 +48,7 @@ git switch notion-backups          # check out the latest snapshot
 git log notion-backups --oneline   # see all daily snapshots
 ```
 
-The workflow restores the previous snapshot from `notion-backups` into the runner before exporting, so the exporter can do incremental work and the quality gate can compare against prior counts.
+The workflow shallow-fetches `notion-backups` and restores only manifests for quality comparisons, plus historical API block state when the optional API export runs. It does not check out old HTML or ZIP archives. Publication uses a separate Git index and a normal fast-forward push, avoiding duplicate copies of the backup directory.
 
 ## Repository layout (on `main`)
 
@@ -109,12 +110,16 @@ Workspace-mode tunables (env vars or `backup.config.yaml`):
 | Env | Default | Purpose |
 |---|---|---|
 | `OFFICIAL_WORKSPACE_RETRYABLE_FAILURE_RETRIES` | `1` | How many fresh task attempts to make if Notion returns `retryable_failure` |
-| `OFFICIAL_WORKSPACE_POLL_TIMEOUT_SECONDS` | `10800` (3 hr) | Per-attempt budget for Notion's server-side export to complete |
+| `OFFICIAL_WORKSPACE_POLL_TIMEOUT_SECONDS` | `10800` (3 hr) | Per-run wait budget; pending requests resume on the next run |
 | `OFFICIAL_WORKSPACE_UI_FALLBACK` | `0` | Browser fallback. **Dormant** — see [Fallbacks](#fallbacks) |
 | `OFFICIAL_WORKSPACE_UI_TIMEOUT_SECONDS` | `2400` (40 min) | Browser fallback budget (only if re-enabled) |
 | `NOTION_USER_AGENT` | a Chrome UA | `User-Agent` sent on every `api/v3` call. Load-bearing: Notion's WAF blocks Node's default UA (`node`) |
 
-For reference, a mid-sized workspace (a few thousand pages) typically finishes in roughly 10–15 minutes end-to-end on the runner — most of that is Notion building the export server-side, not download or processing. Larger workspaces take proportionally longer; raise `OFFICIAL_WORKSPACE_POLL_TIMEOUT_SECONDS` if yours exceeds the budget.
+Exports can take minutes or several hours. Notion may report task `success` before the download link is ready. The exporter checks notifications and task status every 30 seconds, logs request errors and task state changes, and prints CI progress once per minute.
+
+In CI, `OFFICIAL_EXPORT_PERSIST_STATE=1` saves the request immediately to `notion-export-state`. A timeout retains it for the next daily or manual run instead of triggering another export. With the daily schedule, an export that finishes after the three-hour wait is normally collected the following day. State is cleared after successful publication or an explicit terminal task failure. Requests older than six days stop for investigation before the download link expires.
+
+Local runs keep state in `backups/.state/workspace-export.json`. When using remote checkpoints locally, restore them with `python3 scripts/backup_git.py restore-state` before export, and clear them with `python3 scripts/backup_git.py complete-state` only after successful publication.
 
 ## Schedule
 
@@ -123,10 +128,9 @@ Defined in `.github/workflows/notion-backup.yml`:
 ```yaml
 schedule:
   - cron: "0 2 * * *"   # daily at 02:00 UTC
-  - cron: "0 3 * * 0"   # extra Sunday run at 03:00 UTC
 ```
 
-Plus `workflow_dispatch` for manual runs.
+Plus `workflow_dispatch` for manual runs. The runner is pinned to Ubuntu 24.04. Browser installation is skipped while the browser fallback is disabled.
 
 GitHub disables scheduled workflows on repos with no activity for ~60 days. Daily snapshots landing on `notion-backups` keep the schedule alive automatically.
 
@@ -137,7 +141,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 npm install
-npx playwright install chromium
 
 cp .env.example .env
 # fill in NATIVE_EXPORT_TOKEN_V2, NATIVE_EXPORT_FILE_TOKEN, NOTION_SPACE_ID
@@ -149,25 +152,25 @@ python scripts/render_html.py          # markdown -> HTML
 python scripts/export_official.py
 ```
 
-Extraction is platform-aware and needs no setup: `unzip` on Linux (GitHub Actions `ubuntu-latest`), `/usr/bin/ditto` on macOS.
+Extraction is platform-aware and needs no setup: `unzip` on Linux (GitHub Actions `ubuntu-24.04`), `/usr/bin/ditto` on macOS.
 
 > **Why two extractors.** Apple's `unzip` is Info-ZIP 6.00 (2009) without the UTF-8 filename patch Ubuntu carries. If your workspace has any page title with non-ASCII characters, it mangles the name, APFS rejects the invalid bytes, and it reports `write error (disk full?)` with exit 50 — on a disk with plenty of room. `ditto` handles the same archive correctly. If you ever see exit 50, check `df -h` before believing the message.
 
 ## How a run works end-to-end
 
 1. Workflow starts (cron or manual).
-2. Restore previous `backups/` from the `notion-backups` branch into the runner workspace.
+2. Restore pending export state and previous quality manifests from their dedicated branches.
 3. `export_official_zip.mjs`:
    - **Preflight**: one `POST /api/v3/getSpaces`. Exits immediately with a specific message if the edge is blocking us or the cookie is dead, so those never masquerade as export failures.
-   - `POST /api/v3/enqueueTask` with `exportSpace` and your space ID → get back `taskId`.
-   - Poll `POST /api/v3/getTasks` *and* `POST /api/v3/getNotificationLogV2` in parallel. The export URL arrives via the notifications endpoint (an `export-completed` activity with `start_time >= taskStartedAt`).
+   - Resume a pending task, or request `exportSpace` and persist its `taskId` immediately.
+   - Check `POST /api/v3/getNotificationLogV2`, then `POST /api/v3/getTasks`, every 30 seconds. The export URL arrives via the notifications endpoint (an `export-completed` activity with `start_time >= taskStartedAt`).
    - Download the signed ZIP from the URL.
    - `unzip` the outer wrapper into `backups/.staging/<run>/backups/official/`.
    - Find any `*-Part-N.zip` inner archives and `unzip` each in place (Notion delivers exports as wrapper + parts via the API path).
 4. Recursive scan counts `.md`, `.csv`, `.html` files. Quality gate compares to the prior snapshot.
 5. If the quality gate passes, promote staging → `backups/official/` atomically.
-6. `render_html.py` builds `backups/site/`.
-7. Publish step: switch to `notion-backups` branch, wipe worktree, copy fresh `backups/` in, commit, push.
+6. Discard the staged ZIP after validation. Render HTML in staging, replacing `backups/site/` only after every page succeeds.
+7. Publish an explicit allowlist using a separate Git index, preserving history and excluding staging and checkpoints. Clear the pending request after publication succeeds.
 
 ## Quality gates
 
@@ -212,8 +215,20 @@ The exporter records `blocked_by_edge`, `cf_ray`, and a response snippet in `bac
 - **The `User-Agent` header is load-bearing.** Every `api/v3` call must send one. This is not cosmetic: in August 2026 Notion's WAF began blocking Node's default `User-Agent: node`, which silently broke every export until an explicit UA was set.
 - **Notion's export is not a workspace-restoration format.** It's a high-fidelity snapshot of content — readable, grep-able, diff-able — but does not preserve database views, relations, rollups, or formulas in a way that round-trips through Notion's import. Per Notion's own docs: *"You can't instantly recreate your workspace by reuploading your exported workspace content."* For 95% of "I need to read a lost page" scenarios this is fine.
 - **Notion's API is undocumented and internal.** The endpoints used (`enqueueTask`, `getTasks`, `getNotificationLogV2`) are the same ones Notion's web UI uses. They can change.
-- **The runner needs `unzip`.** GitHub `ubuntu-latest` has it. If you ever switch to a different image, verify `which unzip` returns a path. macOS local runs use `ditto` instead, for the reason described under [Local run](#local-run).
+- **The runner needs `unzip`.** GitHub `ubuntu-24.04` has it. If you ever switch to a different image, verify `which unzip` returns a path. macOS local runs use `ditto` instead, for the reason described under [Local run](#local-run).
 - **First run on a fresh template** will exit cleanly with a setup notice until you add the required secrets. After secrets are configured, run the workflow manually from the Actions tab to seed the `notion-backups` branch — subsequent scheduled runs build on that.
+
+## Storage and validation
+
+ZIP downloads are temporary transport files, discarded after successful extraction and quality checks. Their size and SHA-256 remain in the coverage report. Existing legacy archives stay referenced in Git without being checked out or duplicated. Failed exports cannot replace the verified backup.
+
+Run the regression checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+node --test tests/workspace_export_task.test.mjs
+node --check scripts/export_official_zip.mjs
+```
 
 ## License
 

@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import dotenv from "dotenv";
+import { pollWorkspaceExport } from "./workspace_export_task.mjs";
 
 let retryAttemptsTotal = 0;
 
@@ -258,7 +259,7 @@ function describeApiFailure(res, bodyText) {
 }
 
 async function notionApiPost(pathname, body, cookieHeader) {
-  const maxAttempts = 16;
+  const maxAttempts = pathname === "enqueueTask" ? 1 : 4;
   const stage = stageLabel(pathname);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let res;
@@ -271,10 +272,12 @@ async function notionApiPost(pathname, body, cookieHeader) {
           "User-Agent": userAgent(),
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
       });
     } catch (err) {
       if (attempt < maxAttempts) {
         retryAttemptsTotal += 1;
+        console.warn(`[api-retry] endpoint=${pathname} network_error attempt=${attempt}/${maxAttempts}`);
         await sleep(350 * attempt);
         continue;
       }
@@ -290,6 +293,7 @@ async function notionApiPost(pathname, body, cookieHeader) {
     const status = res.status;
     if ((status === 429 || status >= 500) && attempt < maxAttempts) {
       retryAttemptsTotal += 1;
+      console.warn(`[api-retry] endpoint=${pathname} http=${status} attempt=${attempt}/${maxAttempts}`);
       const retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));
       const delay = retryAfterMs ?? Math.min(30000, 1500 * attempt);
       await sleep(delay);
@@ -373,10 +377,10 @@ function extractZipToDir(zipPath, destDir) {
   //   - Linux (CI): `unzip`. Ubuntu's build carries the UTF-8 filename-flag
   //     patch, so non-ASCII names extract correctly.
   //   - macOS (local debugging): `ditto`. Apple's `unzip` is Info-ZIP 6.00
-  //     (2009) *without* that patch. It mangles non-ASCII page titles, APFS
-  //     rejects the resulting invalid byte sequence, and unzip reports the
-  //     failure as `write error (disk full?)` with exit 50 -- on a disk with
-  //     plenty of space free. `ditto` honors the flag and extracts cleanly.
+  //     (2009) *without* that patch. It mangles UTF-8 names (e.g. "Möbel!"),
+  //     APFS rejects the resulting invalid byte sequence, and unzip reports
+  //     the failure as `write error (disk full?)` with exit 50 -- on a disk
+  //     with a terabyte free. `ditto` honors the flag and extracts cleanly.
   mkdirp(destDir);
   const useDitto = process.platform === "darwin" && fs.existsSync("/usr/bin/ditto");
   const cmd = useDitto ? "/usr/bin/ditto" : "unzip";
@@ -468,7 +472,8 @@ async function fetchExportUrlFromNotifications(spaceIdDashed, startTimeMs, cooki
       }
     }
     return null;
-  } catch {
+  } catch (err) {
+    console.warn(`[notifications] lookup failed; http=${err.httpStatus ?? "network/unknown"}`);
     return null;
   }
 }
@@ -566,106 +571,26 @@ async function getExportZip(rootId, tokenV2, fileToken) {
 }
 
 async function getWorkspaceExportZip(spaceId, tokenV2, fileToken, options = {}) {
-  const parsed = parseSpaceId(spaceId);
-  if (!parsed) {
-    throw new Error("NOTION_SPACE_ID must be a 32-char hex UUID (dashes allowed)");
-  }
-  const maxTaskAttempts = Number(options.maxTaskAttempts || 3);
-  const pollTimeoutMs = Number(options.pollTimeoutMs || 25 * 60 * 1000);
   const cookieHeader = notionCookieHeader(tokenV2, fileToken);
-
-  let lastErr = null;
-  for (let taskAttempt = 1; taskAttempt <= maxTaskAttempts; taskAttempt += 1) {
-    const taskStartedAt = Date.now();
-    const enqueue = await notionApiPost(
-      "enqueueTask",
-      {
-        task: {
-          eventName: "exportSpace",
-          request: {
-            spaceId: parsed.dashed,
-            shouldExportComments: false,
-            // Matches the workspace export UI's "Include private pages" toggle.
-            includePrivatePages: true,
-            exportOptions: {
-              exportType: "markdown",
-              timeZone: "UTC",
-              locale: "en",
-              includeContents: "everything",
-            },
-          },
-        },
-      },
-      cookieHeader
-    );
-    const taskId = enqueue?.taskId;
-    if (!taskId) {
-      throw new Error(`enqueueTask returned no taskId for space ${parsed.dashed}`);
-    }
-
-    const deadline = Date.now() + pollTimeoutMs;
-    let lastNotifPollAt = 0;
-    while (Date.now() < deadline) {
-      await sleep(1200);
-      const tasks = await notionApiPost("getTasks", { taskIds: [taskId] }, cookieHeader);
-      const task = tasks?.results?.find((t) => t?.id === taskId) || tasks?.results?.[0];
-      const state = task?.state;
-      const exportUrl =
-        task?.status?.exportURL ||
-        task?.status?.exportUrl ||
-        task?.status?.export_url ||
-        task?.status?.url ||
-        task?.status?.signedUrl ||
-        null;
-      if (state === "success" && exportUrl) {
-        return downloadExportZip(exportUrl, cookieHeader, 3);
+  const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  const statePath = path.join(repoRoot, "backups", ".state", "workspace-export.json");
+  return pollWorkspaceExport({
+    spaceId,
+    readState: () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : null,
+    saveState: (state) => {
+      mkdirp(path.dirname(statePath));
+      writeJson(statePath, state);
+      if (process.env.OFFICIAL_EXPORT_PERSIST_STATE === "1") {
+        const result = spawnSync("python3", ["scripts/backup_git.py", "save-state"], { stdio: "inherit", cwd: repoRoot });
+        if (result.error || result.status !== 0) throw new Error("Could not persist export request checkpoint; stopping to avoid duplicate requests");
       }
-      // Notion stopped attaching the URL to getTasks responses; the URL is now
-      // delivered via the notifications panel. Throttle to one notif poll per 5s.
-      if (Date.now() - lastNotifPollAt >= 5000) {
-        lastNotifPollAt = Date.now();
-        const notifUrl = await fetchExportUrlFromNotifications(parsed.dashed, taskStartedAt, cookieHeader);
-        if (notifUrl) {
-          return downloadExportZip(notifUrl, cookieHeader, 3);
-        }
-      }
-      if (state === "success" && !exportUrl) {
-        // Notion can mark success before the signed download URL is attached.
-        continue;
-      }
-      if (!state || ["in_progress", "not_started"].includes(state)) {
-        continue;
-      }
-      if (state === "retryable_failure" && taskAttempt < maxTaskAttempts) {
-        retryAttemptsTotal += 1;
-        await sleep(Math.min(15000, 2500 * taskAttempt));
-        lastErr = Object.assign(new Error(`workspace export task failed with state=${state}`), {
-          stage: "poll_task",
-          taskState: state,
-          taskId,
-          taskAttempt,
-          maxTaskAttempts,
-        });
-        break;
-      }
-      throw Object.assign(new Error(`workspace export task failed with state=${state}`), {
-        stage: "poll_task",
-        taskState: state,
-        taskId,
-        taskAttempt,
-        maxTaskAttempts,
-      });
-    }
-    if (Date.now() >= deadline) {
-      lastErr = Object.assign(new Error(`workspace export task timed out after ${Math.round(pollTimeoutMs / 1000)}s`), {
-        stage: "poll_task",
-        taskState: "timeout",
-        taskAttempt,
-        maxTaskAttempts,
-      });
-    }
-  }
-  throw lastErr || Object.assign(new Error("workspace export task failed"), { stage: "poll_task" });
+    },
+    post: (endpoint, body) => notionApiPost(endpoint, body, cookieHeader),
+    notificationUrl: (space, since) => fetchExportUrlFromNotifications(space, since, cookieHeader),
+    download: (url) => downloadExportZip(url, cookieHeader, 3),
+    pollTimeoutMs: options.pollTimeoutMs,
+    maxTaskAttempts: options.maxTaskAttempts,
+  });
 }
 
 function promoteDir(src, dst) {
@@ -772,9 +697,6 @@ async function main() {
   const maxDropPercent = Number(
     process.env.QUALITY_MAX_DROP_PERCENT || cfg?.quality?.max_drop_percent || "60"
   );
-  const keepZipDays = Number(
-    process.env.OFFICIAL_ZIP_KEEP_DAYS || cfg?.official_zip?.keep_daily_zips_days || "30"
-  );
   const workspaceRetryableRetries = Number(
     process.env.OFFICIAL_WORKSPACE_RETRYABLE_FAILURE_RETRIES ||
       cfg?.official_zip?.workspace_retryable_failure_retries ||
@@ -836,11 +758,11 @@ async function main() {
     const rate = done / elapsed;
     const eta = rate > 0 ? (totalTargets - done) / rate : Infinity;
     const line = `${frame} Official export ${bar} ${String(pct).padStart(3)}% ${done}/${totalTargets} | ${rate.toFixed(2)}/s | ETA ${formatEta(eta)} | r:${retryAttemptsTotal} f:${failures.length}`;
-    process.stdout.write(`\r${line}`);
+    process.stdout.write(process.stdout.isTTY ? `\r${line}` : `${line}\n`);
   };
 
   renderProgress(0);
-  const spinnerTimer = setInterval(() => renderProgress(zipRecords.length + failures.length), 120);
+  const spinnerTimer = setInterval(() => renderProgress(zipRecords.length + failures.length), process.stdout.isTTY ? 120 : 60000);
 
   if (exportMode === "workspace") {
     const zipPath = path.join(stageNativeDate, `workspace-${spaceId.slice(0, 8)}.zip`);
@@ -1008,6 +930,7 @@ async function main() {
     html_count: htmlFiles.length,
     zip_count: zipRecords.length,
     zip_records: zipRecords,
+    zip_retention: "temporary; discarded after successful export",
     previous: previousCoverage
       ? {
           run_id: previousCoverage.run_id || null,
@@ -1137,25 +1060,6 @@ async function main() {
   mkdirp(canonicalBackups);
   promoteDir(stageOfficial, path.join(canonicalBackups, "official"));
 
-  const canonicalNativeDate = path.join(canonicalBackups, "native", startedAt.slice(0, 10));
-  mkdirp(path.dirname(canonicalNativeDate));
-  promoteDir(stageNativeDate, canonicalNativeDate);
-
-  // Keep native archives bounded by retention days.
-  const nativeRoot = path.join(canonicalBackups, "native");
-  if (fs.existsSync(nativeRoot) && keepZipDays > 0) {
-    const dirs = fs
-      .readdirSync(nativeRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-      .sort();
-    if (dirs.length > keepZipDays) {
-      for (const old of dirs.slice(0, dirs.length - keepZipDays)) {
-        fs.rmSync(path.join(nativeRoot, old), { recursive: true, force: true });
-      }
-    }
-  }
-
   const canonicalManifests = path.join(canonicalBackups, "manifests");
   mkdirp(canonicalManifests);
   for (const filename of [
@@ -1167,6 +1071,10 @@ async function main() {
   ]) {
     fs.copyFileSync(path.join(stageManifests, filename), path.join(canonicalManifests, filename));
   }
+
+  // ZIPs are transport files. Keep their checksums in coverage_report, but
+  // discard the downloaded archive only after extraction and quality checks pass.
+  fs.rmSync(path.join(canonicalBackups, ".staging", run), { recursive: true, force: true });
 
   console.log(
     `Official export complete. mode=${runSummary.export_mode} roots_ok=${zipRecords.length} md=${mdFiles.length} csv=${csvFiles.length} quality=pass`

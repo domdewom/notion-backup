@@ -10,7 +10,6 @@ on:
         default: false
   schedule:
     - cron: "0 2 * * *"
-    - cron: "0 3 * * 0"
 
 permissions:
   contents: write
@@ -21,7 +20,7 @@ concurrency:
 
 jobs:
   backup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
       NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
@@ -32,13 +31,13 @@ jobs:
       OFFICIAL_EXPORT_MODE: "workspace"
       OFFICIAL_WORKSPACE_RETRYABLE_FAILURE_RETRIES: "1"
       OFFICIAL_WORKSPACE_POLL_TIMEOUT_SECONDS: "10800"
+      OFFICIAL_EXPORT_PERSIST_STATE: "1"
       # Dormant browser fallback - see scripts/export_workspace_ui.mjs.
       OFFICIAL_WORKSPACE_UI_FALLBACK: "0"
       OFFICIAL_WORKSPACE_UI_TIMEOUT_SECONDS: "2400"
       QUALITY_MIN_MD_COUNT: "100"
       QUALITY_MIN_CSV_COUNT: "10"
       QUALITY_MAX_DROP_PERCENT: "60"
-      OFFICIAL_ZIP_KEEP_DAYS: "30"
       PROGRESS_MODE: plain
 
     steps:
@@ -78,24 +77,26 @@ jobs:
       # Only needed by the dormant browser fallback (OFFICIAL_WORKSPACE_UI_FALLBACK).
       # Kept so re-enabling that flag doesn't fail on a missing browser.
       - name: Install Playwright browser
-        if: steps.setup.outputs.configured == 'true'
+        if: ${{ steps.setup.outputs.configured == 'true' && env.OFFICIAL_WORKSPACE_UI_FALLBACK == '1' }}
         run: npx playwright install --with-deps chromium
+
+      - name: Restore pending export request
+        if: steps.setup.outputs.configured == 'true'
+        run: python3 scripts/backup_git.py restore-state
+
+      - name: Disk usage before restore
+        if: steps.setup.outputs.configured == 'true'
+        run: df -h .; df -i .; du -sh .git
 
       - name: Restore previous backup state
         if: steps.setup.outputs.configured == 'true'
+        env:
+          API_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.run_api_fallback == true }}
         run: |
-          set -euo pipefail
-          BACKUP_BRANCH="notion-backups"
-
-          if git ls-remote --exit-code --heads origin "${BACKUP_BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${BACKUP_BRANCH}"
-            if git cat-file -e FETCH_HEAD:backups 2>/dev/null; then
-              git restore --source=FETCH_HEAD --worktree -- backups
-            else
-              echo "${BACKUP_BRANCH} exists but has no backups directory; starting from scratch"
-            fi
+          if [ "$API_FALLBACK" = "true" ]; then
+            python3 scripts/backup_git.py restore --api-fallback
           else
-            echo "No existing ${BACKUP_BRANCH} branch; starting from scratch"
+            python3 scripts/backup_git.py restore
           fi
 
       - name: Export via official Notion ZIP flow
@@ -110,40 +111,25 @@ jobs:
         if: steps.setup.outputs.configured == 'true'
         run: python3 scripts/render_html.py
 
+      - name: Disk usage before publish
+        if: steps.setup.outputs.configured == 'true'
+        run: df -h .; df -i .; du -sh .git backups backups/*
+
       - name: Publish backups to backup branch
         if: steps.setup.outputs.configured == 'true'
         run: |
-          set -euo pipefail
-          BACKUP_BRANCH="notion-backups"
-          PUBLISH_DIR="$(mktemp -d)"
-
-          cp -a backups "${PUBLISH_DIR}/backups"
-
           git config user.name "notion-backup-bot"
           git config user.email "notion-backup-bot@users.noreply.github.com"
+          python3 scripts/backup_git.py publish
+          python3 scripts/backup_git.py complete-state
 
-          if git ls-remote --exit-code --heads origin "${BACKUP_BRANCH}" >/dev/null 2>&1; then
-            git fetch origin "${BACKUP_BRANCH}"
-            git switch --detach FETCH_HEAD
-            git switch -C "${BACKUP_BRANCH}"
-          else
-            git switch --orphan "${BACKUP_BRANCH}"
-          fi
-
-          git rm -r --ignore-unmatch -q .
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-          cp -a "${PUBLISH_DIR}/backups" ./backups
-
-          git add -A backups
-
-          if git diff --cached --quiet; then
-            echo "No backup changes to commit"
-            exit 0
-          fi
-
-          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git commit -m "backup: notion snapshot ${TS}"
-          git push origin "${BACKUP_BRANCH}"
+      - name: Final disk usage
+        if: ${{ always() && steps.setup.outputs.configured == 'true' }}
+        run: |
+          df -h .
+          df -i .
+          du -sh .git
+          if [ -d backups ]; then du -sh backups; fi
 
       - name: Upload run reports
         if: ${{ always() && steps.setup.outputs.configured == 'true' }}
